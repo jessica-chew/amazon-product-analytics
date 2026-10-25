@@ -9,6 +9,29 @@ from sklearn.model_selection import train_test_split
 st.set_page_config(page_title="Amazon Product Explorer", layout="wide")
 st.title("Amazon Product Explorer")
 
+st.markdown(
+    """
+    **Explore and predict Amazon product metrics.** Upload an Amazon product CSV to
+    preview the records, compare numeric product attributes using a histogram,
+    scatter plot, or line chart, and build a linear regression model. Choose two
+    numeric inputs and a target, then enter your own values to see a predicted
+    result. The app also reports test-set R² and mean absolute error to help you
+    evaluate the model.
+
+    **Automatic data cleaning:** The app removes currency symbols (₹), commas,
+    and percent signs from the Amazon numeric fields, converts those fields to
+    numbers, and treats missing, nonnumeric, or out-of-range entries as missing
+    values. Affected rows are excluded only from charts or models that use those
+    columns; the app does not impute missing values. The preview shows the cleaned
+    data, and any invalid-entry counts appear below it.
+
+    **Purpose and limitations:** This model estimates an Amazon product metric
+    from two other numeric characteristics. Incorrect predictions could mislead
+    price comparisons or purchasing decisions. Predictions are statistical
+    estimates, not guarantees.
+    """
+)
+
 # Amazon columns need their symbols removed before pandas can treat them as numbers.
 AMAZON_NUMERIC_COLS = [
     "discount_percentage", "rating", "rating_count",
@@ -55,49 +78,46 @@ def clean_data(raw_df):
 
 
 def get_user_input(feature, training_values):
-    """Select valid widget limits based on the chosen predictor."""
+    """Allow manual input; validate afterward so errors explain valid values."""
     median = float(training_values.median())
-    label = f"Enter {feature}"
-
     if feature == "rating":
-        return st.number_input(
-            label, min_value=1.0, max_value=5.0,
-            value=round(min(max(median, 1.0), 5.0), 1),
-            step=0.1, key=f"input_{feature}"
-        )
-    if feature == "rating_count":
-        return st.number_input(
-            label, min_value=0, value=max(0, int(round(median))),
-            step=1, key=f"input_{feature}"
-        )
-    if feature == "discount_percentage":
-        return st.number_input(
-            label, min_value=0.0, max_value=100.0,
-            value=min(max(median, 0.0), 100.0),
-            step=1.0, key=f"input_{feature}"
-        )
-    if feature in ("actual_price", "discounted_price"):
-        return st.number_input(
-            label, min_value=0.0, value=max(0.0, median),
-            step=1.0, key=f"input_{feature}"
-        )
-    # Other uploaded CSVs may have different numeric fields.
-    return st.number_input(label, value=median, key=f"input_{feature}")
+        step = 0.1
+    elif feature == "rating_count":
+        step = 1.0
+    else:
+        step = 1.0
+
+    value = st.number_input(
+        f"Enter {feature}",
+        value=round(median, 1) if feature == "rating" else median,
+        step=step,
+        key=f"input_{feature}",
+    )
+    hints = {
+        "rating": "Valid range: 1 to 5.",
+        "rating_count": "Valid values: nonnegative whole numbers.",
+        "discount_percentage": "Valid range: 0% to 100%.",
+        "actual_price": "Valid values: 0 or greater.",
+        "discounted_price": "Valid values: 0 or greater.",
+    }
+    if feature in hints:
+        st.caption(hints[feature])
+    return value
 
 
-def valid_value(feature, value):
-    """Second-level validation before a value reaches the model."""
+def input_error(feature, value):
+    """Return a helpful error message, or None if the value is valid."""
     if value is None or not isinstance(value, (int, float, np.number)) or not np.isfinite(value):
-        return False
-    if feature == "rating":
-        return 1 <= value <= 5
-    if feature == "discount_percentage":
-        return 0 <= value <= 100
-    if feature == "rating_count":
-        return value >= 0 and value == int(value)
-    if feature in ("actual_price", "discounted_price"):
-        return value >= 0
-    return True
+        return f"{feature}: enter a finite numeric value."
+    if feature == "rating" and not (1 <= value <= 5):
+        return "Rating must be between 1 and 5 (inclusive)."
+    if feature == "discount_percentage" and not (0 <= value <= 100):
+        return "Discount percentage must be between 0% and 100% (inclusive)."
+    if feature == "rating_count" and (value < 0 or value != int(value)):
+        return "Rating count must be a nonnegative whole number (0, 1, 2, ...)."
+    if feature in ("actual_price", "discounted_price") and value < 0:
+        return f"{feature} must be 0 or greater (prices cannot be negative)."
+    return None
 
 
 # 1. Upload, clean, and preview
@@ -222,8 +242,13 @@ with col1:
 with col2:
     value2 = get_user_input(feature2, X[feature2])
 
-if not valid_value(feature1, value1) or not valid_value(feature2, value2):
-    st.error("Invalid input. Please enter values within the allowed range.")
+errors = [
+    message for feature, value in [(feature1, value1), (feature2, value2)]
+    if (message := input_error(feature, value)) is not None
+]
+if errors:
+    for message in errors:
+        st.error(message)
     st.stop()
 
 for col, value in [(feature1, value1), (feature2, value2)]:
@@ -257,9 +282,3 @@ elif target == "rating_count":
 elif target in ("actual_price", "discounted_price") and prediction < 0:
     st.warning("The predicted price is negative and is not a valid price.")
 
-# 5. Model purpose and consequences
-st.write(
-    "This model estimates an Amazon product metric using two other "
-    "numeric characteristics; incorrect predictions could mislead "
-    "price comparisons or purchasing decisions."
-)

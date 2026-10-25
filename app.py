@@ -1,167 +1,205 @@
-import streamlit as st
+"""General-purpose CSV explorer with charts and two-feature linear regression."""
+
+import re
+import unicodedata
+
+import numpy as np
 import pandas as pd
 import plotly.express as px
-
+import streamlit as st
 from sklearn.linear_model import LinearRegression
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.model_selection import train_test_split
 
-st.set_page_config(page_title="Amazon Product Explorer", layout="wide")
-st.title("Amazon Product Explorer")
+st.set_page_config(page_title="CSV Data Explorer", layout="wide")
+st.title("CSV Data Explorer")
+st.write("Upload a CSV containing at least three numeric columns.")
 
-# 1. Upload and preview data
-uploaded_file = st.file_uploader("Upload a CSV file", type="csv")
-
-if uploaded_file is None:
-    st.info("Upload your Amazon CSV file to begin.")
-    st.stop()
-
-df = pd.read_csv(uploaded_file)
-
-# Clean numeric columns (based on your existing notebook)
-cols_to_convert = [
-    "discount_percentage", "rating", "rating_count",
-    "actual_price", "discounted_price"
-]
-
-for col in cols_to_convert:
-    if col in df.columns:
-        df[col] = (
-            df[col].astype(str)
-            .str.replace(r"[₹,%]", "", regex=True)
-        )
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-numeric_cols = df.select_dtypes(include="number").columns.tolist()
-
-st.subheader("Dataset Preview")
-st.dataframe(df.head(10), hide_index=True)
-
-if len(numeric_cols) < 3:
-    st.error("The CSV must contain at least three numeric columns.")
-    st.stop()
-
-# 2. Data visualization
-st.subheader("Explore Product Data")
-
-variable = st.selectbox("Choose a numeric column", numeric_cols)
-chart_type = st.selectbox(
-    "Choose a chart type",
-    ["Histogram", "Scatter", "Line"]
+# Interpret familiar numeric formats without using dataset-specific column names.
+NUMBER_PATTERN = re.compile(
+    r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$"
 )
+
+
+def parse_number(value):
+    """Turn ordinary numeric text into a number; return NaN for invalid text."""
+    if pd.isna(value):
+        return np.nan
+    text = str(value).strip()
+    if not text:
+        return np.nan
+    if text.endswith("%"):
+        text = text[:-1].strip()  # 25% is represented as 25.
+    if text and unicodedata.category(text[0]) == "Sc":
+        text = text[1:].strip()
+    if text and unicodedata.category(text[-1]) == "Sc":
+        text = text[:-1].strip()
+    # Interpret commas as thousands separators only when grouping is valid.
+    if "," in text:
+        grouped = re.fullmatch(
+            r"([+-]?\d{1,3})(,\d{3})+(\.\d*)?([eE][+-]?\d+)?", text
+        )
+        if grouped is None:
+            return np.nan
+        text = text.replace(",", "")
+    if NUMBER_PATTERN.fullmatch(text) is None:
+        return np.nan
+    number = pd.to_numeric(text, errors="coerce")
+    return float(number) if pd.notna(number) and np.isfinite(number) else np.nan
+
+
+def clean_data(raw_df):
+    """Detect numeric columns; interpret invalid entries as missing values.
+
+    A text column is treated as numeric if at least half of its nonblank
+    entries look numeric. This is a heuristic, not a universal type detector.
+    """
+    data = raw_df.copy()
+    converted = []
+    for column in data.columns:
+        series = data[column]
+        if pd.api.types.is_bool_dtype(series):
+            continue
+        if pd.api.types.is_numeric_dtype(series):
+            data[column] = pd.to_numeric(series, errors="coerce").replace(
+                [np.inf, -np.inf], np.nan
+            )
+            continue
+        nonblank = series.notna() & series.astype("string").str.strip().ne("")
+        if not nonblank.any():
+            continue
+        parsed = series.map(parse_number).astype(float)
+        if parsed.notna().sum() / nonblank.sum() >= 0.5:
+            data[column] = parsed
+            converted.append(str(column))
+    numeric_columns = [
+        col for col in data.select_dtypes(include="number").columns
+        if data[col].notna().any()
+    ]
+    return data, numeric_columns, converted
+
+
+# 1. Upload the dataset and preview its contents.
+file = st.file_uploader("Upload CSV", type="csv")
+if file is None:
+    st.info("Upload a file to begin.")
+    st.stop()
+
+try:
+    raw_df = pd.read_csv(file)
+    df, numeric_columns, converted_columns = clean_data(raw_df)
+except (pd.errors.ParserError, pd.errors.EmptyDataError, UnicodeError, ValueError) as error:
+    st.error(f"Could not read this CSV: {error}")
+    st.stop()
+
+st.subheader("Data Preview")
+st.dataframe(df.head(10), hide_index=True)
+if converted_columns:
+    st.caption("Converted numeric-looking text in: " + ", ".join(converted_columns))
+
+# This is the sole dataset-eligibility requirement.
+if len(numeric_columns) < 3:
+    st.error("Please upload a CSV with at least three usable numeric columns.")
+    st.stop()
+
+# 2. Visualize the data (drop missing values only for columns used in the chart).
+st.subheader("Data Visualization")
+chosen_column = st.selectbox("Choose a numeric column", numeric_columns)
+chart_type = st.selectbox("Choose a chart type", ["Histogram", "Scatter", "Line"])
 
 if chart_type == "Histogram":
-    fig = px.histogram(df, x=variable, title=f"Distribution of {variable}")
-
+    fig = px.histogram(
+        df.dropna(subset=[chosen_column]),
+        x=chosen_column,
+        title=f"Distribution of {chosen_column}",
+    )
 elif chart_type == "Scatter":
-    x_options = [col for col in numeric_cols if col != variable]
-    x_variable = st.selectbox("Choose an X-axis column", x_options)
+    x_column = st.selectbox(
+        "Choose an X-axis column", [c for c in numeric_columns if c != chosen_column]
+    )
+    chart_data = df.dropna(subset=[x_column, chosen_column])
     fig = px.scatter(
-        df, x=x_variable, y=variable,
-        title=f"{variable} vs. {x_variable}"
+        chart_data, x=x_column, y=chosen_column,
+        title=f"{chosen_column} vs. {x_column}",
     )
-
 else:
-    plot_df = df[[variable]].reset_index()
-    plot_df = plot_df.rename(columns={"index": "Product row"})
-    fig = px.line(
-        plot_df, x="Product row", y=variable,
-        title=f"{variable} by Product Row"
-    )
-    st.caption("Row order is not a time sequence.")
+    # Without a date column, a line chart follows the original row order.
+    chart_data = pd.DataFrame({
+        "Row": np.arange(1, len(df) + 1),
+        chosen_column: df[chosen_column].to_numpy(),
+    })
+    fig = px.line(chart_data, x="Row", y=chosen_column,
+                  title=f"{chosen_column} by CSV Row")
+    st.caption("A row number is not necessarily a date or time.")
 
-st.plotly_chart(fig, width="stretch")
+st.plotly_chart(fig, use_container_width=True)
 
-# 3. Linear regression
-st.subheader("Predict a Product Metric")
+# 3. Choose any two distinct numeric inputs and a different numeric target.
+st.subheader("Linear Regression")
+target = st.selectbox("Choose the target", numeric_columns)
+feature_options = [c for c in numeric_columns if c != target]
+feature1 = st.selectbox("Choose input 1", feature_options)
+feature2 = st.selectbox("Choose input 2", [c for c in feature_options if c != feature1])
 
-target = st.selectbox(
-    "Choose the prediction target",
-    numeric_cols,
-    index=numeric_cols.index("discounted_price")
-    if "discounted_price" in numeric_cols else 0
+selected = [feature1, feature2, target]
+model_df = df[selected].dropna()
+removed_rows = len(df) - len(model_df)
+st.caption(
+    f"Cleaning: dropped {removed_rows:,} row(s) with missing or invalid "
+    f"values in the three selected columns; {len(model_df):,} rows remain."
 )
 
-feature_options = [col for col in numeric_cols if col != target]
-
-feature1 = st.selectbox(
-    "Choose input 1",
-    feature_options,
-    index=feature_options.index("actual_price")
-    if "actual_price" in feature_options else 0
-)
-
-feature2_options = [col for col in feature_options if col != feature1]
-
-feature2 = st.selectbox(
-    "Choose input 2",
-    feature2_options,
-    index=feature2_options.index("rating_count")
-    if "rating_count" in feature2_options else 0
-)
-
-if (
-    target in ["discounted_price", "actual_price"]
-    and "discount_percentage" in [feature1, feature2]
-):
-    st.warning(
-        "Discount percentage is calculated from the prices. "
-        "Using it here may introduce target leakage."
-    )
-
-# Remove rows with missing values in selected columns
-model_df = df[[feature1, feature2, target]].dropna()
-
-if len(model_df) < 10:
-    st.error("Not enough complete rows to train the model.")
+# A minimum number of complete rows is necessary to train/test a model;
+# this is not an extra CSV validation rule.
+if len(model_df) < 5:
+    st.warning("Not enough complete rows for training and evaluation. Choose other columns or another CSV.")
     st.stop()
 
 X = model_df[[feature1, feature2]]
 y = model_df[target]
+try:
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=42
+    )
+    model = LinearRegression()
+    model.fit(X_train, y_train)
+    test_predictions = model.predict(X_test)
+    mae = mean_absolute_error(y_test, test_predictions)
+    r2 = r2_score(y_test, test_predictions) if y_test.nunique() > 1 else np.nan
+except (ValueError, OverflowError, FloatingPointError) as error:
+    st.error(f"The selected columns could not be used for regression: {error}")
+    st.stop()
 
-# Train on 80%, evaluate on 20%
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42
-)
+st.write(f"**Test MAE:** {mae:,.3f}")
+st.write(f"**Test R²:** {r2:.3f}" if np.isfinite(r2) else "**Test R²:** Not available")
 
-model = LinearRegression()
-model.fit(X_train, y_train)
-
-y_pred = model.predict(X_test)
-
-st.write("**Model Performance (Test Set)**")
-st.write(f"R² Score: {r2_score(y_test, y_pred):.3f}")
-st.write(f"Mean Absolute Error: {mean_absolute_error(y_test, y_pred):,.2f}")
-
-# 4. User prediction inputs
-st.write("**Enter values to make a prediction:**")
-
-col1, col2 = st.columns(2)
-
-with col1:
+# 4. Let the user enter any finite numeric values; no arbitrary min/max constraints.
+st.write("**Enter predictor values:**")
+left, right = st.columns(2)
+with left:
     value1 = st.number_input(
-        f"Enter {feature1}",
-        value=float(X[feature1].median())
+        f"Enter {feature1}", value=float(X[feature1].median()),
+        key=f"feature1_{feature1}",
     )
-
-with col2:
+with right:
     value2 = st.number_input(
-        f"Enter {feature2}",
-        value=float(X[feature2].median())
+        f"Enter {feature2}", value=float(X[feature2].median()),
+        key=f"feature2_{feature2}",
     )
 
-new_data = pd.DataFrame({
-    feature1: [value1],
-    feature2: [value2]
-})
+# The feature names and order must match those used in model.fit().
+new_row = pd.DataFrame([[value1, value2]], columns=[feature1, feature2])
+try:
+    predicted_value = model.predict(new_row)[0]
+    if np.isfinite(predicted_value):
+        st.metric(f"Predicted {target}", f"{predicted_value:,.3f}")
+    else:
+        st.error("The model could not produce a finite prediction.")
+except (ValueError, OverflowError, FloatingPointError) as error:
+    st.error(f"Could not calculate a prediction: {error}")
 
-prediction = model.predict(new_data)[0]
-
-st.metric(f"Predicted {target}", f"{prediction:,.2f}")
-
-# 5. Model purpose and consequences
+# 5. Assignment-required model purpose and consequences statement.
 st.write(
-    "This model estimates an Amazon product metric using two other "
-    "numeric characteristics; incorrect predictions could mislead "
-    "price comparisons or purchasing decisions."
+    "This linear regression predicts one numeric variable using two others; "
+    "incorrect predictions may lead to misleading conclusions or poor decisions."
 )
